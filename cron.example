@@ -1,0 +1,3 @@
+# Refresh stock CSVs every morning at 07:15 UTC.
+# Install with: crontab -e
+15 7 * * * cd /home/joflay/stocks_update && /home/joflay/stocks_update/.venv/bin/python scripts/refresh_stock_data.py >> /home/joflay/stocks_update/refresh_stock_data.log 2>&1
