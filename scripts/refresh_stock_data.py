@@ -28,6 +28,7 @@ FRED_START_DATE = date(2010, 1, 1)
 
 STOCK_FILE_RE = re.compile(r"^(?P<ticker>.+)_stock_data\.csv$")
 YFINANCE_UNIVERSE = "yfinance-raw-split-safe"
+STOCK_RECENT_BACKFILL_DAYS = 14
 
 
 def stock_ticker(path: Path) -> str | None:
@@ -51,6 +52,21 @@ def next_missing_date(existing: pd.DataFrame, default_start: date) -> date:
     if dates.empty:
         return default_start
     return dates.max().date() + timedelta(days=1)
+
+
+def drop_unclosed_rows(existing: pd.DataFrame, today: date) -> pd.DataFrame:
+    """Remove rows for today or later because daily bars are not final yet."""
+    dates = pd.to_datetime(existing["Date"], errors="coerce")
+    return existing[dates.dt.date < today].reset_index(drop=True)
+
+
+def stock_download_start(existing: pd.DataFrame, default_start: date, today: date) -> date:
+    next_date = next_missing_date(existing, default_start)
+    if existing.empty:
+        return next_date
+
+    backfill_start = today - timedelta(days=STOCK_RECENT_BACKFILL_DAYS)
+    return max(default_start, min(next_date, backfill_start))
 
 
 def load_env_value(key: str) -> str | None:
@@ -161,14 +177,49 @@ def format_stock_rows(
     return rows[columns]
 
 
-def append_new_rows(existing: pd.DataFrame, new_rows: pd.DataFrame) -> pd.DataFrame:
-    existing_dates = set(existing["Date"].astype(str))
-    new_rows = new_rows[~new_rows["Date"].astype(str).isin(existing_dates)]
-    if new_rows.empty:
-        return existing
+def is_blank(value: object) -> bool:
+    if pd.isna(value):
+        return True
+    return str(value) == ""
 
-    combined = pd.concat([existing, new_rows], ignore_index=True)
-    return combined.sort_values("Date").reset_index(drop=True)
+
+def merge_stock_rows(
+    existing: pd.DataFrame, new_rows: pd.DataFrame
+) -> tuple[pd.DataFrame, int, int]:
+    existing_dates = set(existing["Date"].astype(str))
+    append_rows = new_rows[~new_rows["Date"].astype(str).isin(existing_dates)]
+
+    updated = existing.copy()
+    filled = 0
+    if not new_rows.empty:
+        row_indexes_by_date = {
+            date_value: index
+            for index, date_value in updated["Date"].astype(str).items()
+        }
+        for _, row in new_rows.iterrows():
+            row_index = row_indexes_by_date.get(str(row["Date"]))
+            if row_index is None:
+                continue
+
+            for column in updated.columns:
+                if column == "Date" or column not in row:
+                    continue
+
+                value = row[column]
+                if is_blank(updated.at[row_index, column]) and not is_blank(value):
+                    updated.at[row_index, column] = value
+                    filled += 1
+
+    if not append_rows.empty:
+        updated = pd.concat([updated, append_rows], ignore_index=True)
+
+    updated = updated.sort_values("Date").reset_index(drop=True)
+    return updated, len(append_rows), filled
+
+
+def append_new_rows(existing: pd.DataFrame, new_rows: pd.DataFrame) -> pd.DataFrame:
+    updated, _, _ = merge_stock_rows(existing, new_rows)
+    return updated
 
 
 def refresh_stock_file(path: Path) -> None:
@@ -176,11 +227,18 @@ def refresh_stock_file(path: Path) -> None:
     if ticker is None:
         return
 
-    existing = clean_dates(pd.read_csv(path))
-    start = next_missing_date(existing, date.today() - timedelta(days=365 * 5))
-    end = date.today() + timedelta(days=1)
+    original = clean_dates(pd.read_csv(path))
+    today = date.today()
+    existing = drop_unclosed_rows(original, today)
+    start = stock_download_start(existing, today - timedelta(days=365 * 5), today)
+    end = today
 
     if start >= end:
+        if len(existing) != len(original):
+            atomic_write_csv(existing, path)
+            logging.info(
+                "%s: removed %s unclosed row(s)", ticker, len(original) - len(existing)
+            )
         logging.info("%s: already current", ticker)
         return
 
@@ -195,16 +253,27 @@ def refresh_stock_file(path: Path) -> None:
     )
     downloaded = flatten_yfinance(downloaded, ticker)
     if downloaded.empty:
+        if len(existing) != len(original):
+            atomic_write_csv(existing, path)
+            logging.info(
+                "%s: removed %s unclosed row(s)", ticker, len(original) - len(existing)
+            )
         logging.info("%s: no new yfinance rows", ticker)
         return
 
     new_rows = format_stock_rows(downloaded, existing, ticker)
-    updated = append_new_rows(existing, new_rows)
-    added = len(updated) - len(existing)
+    updated, added, filled = merge_stock_rows(existing, new_rows)
 
-    if added:
+    removed = len(original) - len(existing)
+    if added or filled or removed:
         atomic_write_csv(updated, path)
-    logging.info("%s: appended %s row(s)", ticker, added)
+    logging.info(
+        "%s: appended %s row(s), filled %s blank value(s), removed %s unclosed row(s)",
+        ticker,
+        added,
+        filled,
+        removed,
+    )
 
 
 def refresh_stocks() -> None:
