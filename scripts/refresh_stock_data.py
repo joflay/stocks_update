@@ -16,6 +16,8 @@ from pathlib import Path
 import pandas as pd
 import yfinance as yf
 
+from historical_beta import BETA_COLUMN, add_historical_beta
+
 
 BASE_DIR = Path("/srv/data")
 STOCKS_DIR = BASE_DIR / "stocks"
@@ -167,8 +169,10 @@ def format_stock_rows(
             rows[column] = downloaded.get("Dividends", 0.0)
         elif column == "Close":
             rows[column] = close
-        elif column in ("stock_beta", "historical_beta"):
+        elif column == "stock_beta":
             rows[column] = last_non_blank(existing, column, "")
+        elif column == BETA_COLUMN:
+            rows[column] = ""
         elif column in downloaded.columns:
             rows[column] = downloaded[column]
         else:
@@ -234,11 +238,14 @@ def refresh_stock_file(path: Path) -> None:
     end = today
 
     if start >= end:
+        existing, beta_filled = add_historical_beta(existing, ticker)
         if len(existing) != len(original):
             atomic_write_csv(existing, path)
             logging.info(
                 "%s: removed %s unclosed row(s)", ticker, len(original) - len(existing)
             )
+        elif beta_filled:
+            atomic_write_csv(existing, path)
         logging.info("%s: already current", ticker)
         return
 
@@ -253,25 +260,35 @@ def refresh_stock_file(path: Path) -> None:
     )
     downloaded = flatten_yfinance(downloaded, ticker)
     if downloaded.empty:
+        existing, beta_filled = add_historical_beta(existing, ticker)
         if len(existing) != len(original):
             atomic_write_csv(existing, path)
             logging.info(
                 "%s: removed %s unclosed row(s)", ticker, len(original) - len(existing)
             )
-        logging.info("%s: no new yfinance rows", ticker)
+        elif beta_filled:
+            atomic_write_csv(existing, path)
+        logging.info(
+            "%s: no new yfinance rows, filled %s beta value(s)", ticker, beta_filled
+        )
         return
 
     new_rows = format_stock_rows(downloaded, existing, ticker)
     updated, added, filled = merge_stock_rows(existing, new_rows)
+    updated, beta_filled = add_historical_beta(updated, ticker)
 
     removed = len(original) - len(existing)
-    if added or filled or removed:
+    if added or filled or removed or beta_filled:
         atomic_write_csv(updated, path)
     logging.info(
-        "%s: appended %s row(s), filled %s blank value(s), removed %s unclosed row(s)",
+        (
+            "%s: appended %s row(s), filled %s blank value(s), "
+            "filled %s beta value(s), removed %s unclosed row(s)"
+        ),
         ticker,
         added,
         filled,
+        beta_filled,
         removed,
     )
 
