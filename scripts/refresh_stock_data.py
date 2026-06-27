@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
@@ -31,6 +32,19 @@ FRED_START_DATE = date(2010, 1, 1)
 STOCK_FILE_RE = re.compile(r"^(?P<ticker>.+)_stock_data\.csv$")
 YFINANCE_UNIVERSE = "yfinance-raw-split-safe"
 STOCK_RECENT_BACKFILL_DAYS = 14
+YFINANCE_STOCK_COLUMNS = [
+    "Date",
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Adj Close",
+    "Volume",
+    "Dividends",
+    "Stock Splits",
+]
+LEGACY_CLOSE_COLUMN = "TR.CLOSEPRICE(Adjusted=0)"
+REFRESHABLE_STOCK_COLUMNS = set(YFINANCE_STOCK_COLUMNS[1:])
 
 
 def stock_ticker(path: Path) -> str | None:
@@ -62,7 +76,18 @@ def drop_unclosed_rows(existing: pd.DataFrame, today: date) -> pd.DataFrame:
     return existing[dates.dt.date < today].reset_index(drop=True)
 
 
-def stock_download_start(existing: pd.DataFrame, default_start: date, today: date) -> date:
+def stock_download_start(
+    existing: pd.DataFrame,
+    default_start: date,
+    today: date,
+    *,
+    full_history: bool = False,
+) -> date:
+    if full_history and not existing.empty:
+        dates = pd.to_datetime(existing["Date"], errors="coerce").dropna()
+        if not dates.empty:
+            return dates.min().date()
+
     next_date = next_missing_date(existing, default_start)
     if existing.empty:
         return next_date
@@ -123,6 +148,11 @@ def flatten_yfinance(downloaded: pd.DataFrame, ticker: str) -> pd.DataFrame:
     return downloaded
 
 
+def yfinance_ticker(ticker: str) -> str:
+    """Convert dot-class tickers such as BRK.B to yfinance's BRK-B form."""
+    return ticker.replace(".", "-")
+
+
 def last_non_blank(existing: pd.DataFrame, column: str, default: object = "") -> object:
     if column not in existing.columns:
         return default
@@ -134,12 +164,82 @@ def last_non_blank(existing: pd.DataFrame, column: str, default: object = "") ->
     return values.iloc[-1]
 
 
+def ensure_stock_schema(existing: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Add the complete yfinance schema while retaining all legacy columns."""
+    updated = existing.copy()
+    legacy_close = updated.get(
+        LEGACY_CLOSE_COLUMN,
+        pd.Series(index=updated.index, dtype="float64"),
+    )
+    close = updated.get("Close", legacy_close)
+    close = close.where(close.notna(), legacy_close)
+
+    defaults: dict[str, object] = {
+        "Date": pd.NA,
+        "Open": pd.NA,
+        "High": pd.NA,
+        "Low": pd.NA,
+        "Close": close,
+        "Adj Close": close,
+        "Volume": pd.NA,
+        "Dividends": pd.NA,
+        "Stock Splits": pd.NA,
+    }
+    for column, default in defaults.items():
+        if column not in updated.columns:
+            updated[column] = default
+
+    updated["Close"] = close
+    updated = updated.drop(columns=[LEGACY_CLOSE_COLUMN], errors="ignore")
+
+    if "ticker" in updated.columns:
+        updated["ticker"] = updated["ticker"].fillna(ticker)
+
+    legacy_columns = [
+        column for column in updated.columns if column not in YFINANCE_STOCK_COLUMNS
+    ]
+    return updated[YFINANCE_STOCK_COLUMNS + legacy_columns]
+
+
+def needs_stock_history_backfill(existing: pd.DataFrame) -> bool:
+    """Return whether canonical yfinance fields need a full-history download."""
+    for column in YFINANCE_STOCK_COLUMNS[1:]:
+        if column not in existing.columns:
+            return True
+        if pd.to_numeric(existing[column], errors="coerce").isna().any():
+            return True
+    return False
+
+
+def split_adjust_yfinance_prices(downloaded: pd.DataFrame) -> pd.DataFrame:
+    """Match the split-safe OHLC transformation used by the options pipeline."""
+    adjusted = downloaded.copy()
+    splits = pd.to_numeric(
+        adjusted.get("Stock Splits", pd.Series(0.0, index=adjusted.index)),
+        errors="coerce",
+    ).fillna(0.0)
+    split_multiplier = splits.where(splits > 0.0, 1.0)
+    future_split_factor = (
+        split_multiplier.iloc[::-1].cumprod().iloc[::-1] / split_multiplier
+    )
+
+    for column in ["Open", "High", "Low"]:
+        if column in adjusted.columns:
+            adjusted[column] = (
+                pd.to_numeric(adjusted[column], errors="coerce") * future_split_factor
+            )
+
+    return adjusted
+
+
 def format_stock_rows(
     downloaded: pd.DataFrame, existing: pd.DataFrame, ticker: str
 ) -> pd.DataFrame:
+    existing = ensure_stock_schema(existing, ticker)
     columns = list(existing.columns)
     rows = pd.DataFrame(index=downloaded.index)
 
+    downloaded = split_adjust_yfinance_prices(downloaded)
     close = downloaded.get("Close", pd.Series(index=downloaded.index, dtype="float64"))
     adj_close = downloaded.get(
         "Adj Close", pd.Series(index=downloaded.index, dtype="float64")
@@ -148,12 +248,10 @@ def format_stock_rows(
     for column in columns:
         if column == "Date":
             rows[column] = downloaded["Date"]
-        elif column == "TR.CLOSEPRICE(Adjusted=0)":
-            rows[column] = close
         elif column == "Adj Close":
             rows[column] = adj_close.fillna(close)
         elif column == "dividend_yield":
-            rows[column] = 0.0
+            rows[column] = ""
         elif column == "ticker":
             rows[column] = ticker
         elif column == "lseg_universe":
@@ -181,6 +279,32 @@ def format_stock_rows(
     return rows[columns]
 
 
+def add_dividend_yield(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate trailing-365-day dividend yield as the source pipeline does."""
+    if df.empty or "Dividends" not in df.columns:
+        return df
+
+    updated = df.copy()
+    dates = pd.to_datetime(updated["Date"], errors="coerce")
+    dividends = pd.to_numeric(updated["Dividends"], errors="coerce").fillna(0.0)
+    prices = pd.to_numeric(updated["Close"], errors="coerce")
+
+    trailing_dividends = (
+        pd.Series(dividends.to_numpy(), index=dates)
+        .rolling("365D", min_periods=1)
+        .sum()
+        .to_numpy()
+    )
+    dividend_yield = pd.Series(trailing_dividends, index=updated.index) / prices
+    updated["dividend_yield"] = (
+        pd.to_numeric(dividend_yield, errors="coerce")
+        .replace([float("inf"), float("-inf")], 0.0)
+        .fillna(0.0)
+        .clip(lower=0.0)
+    )
+    return updated
+
+
 def is_blank(value: object) -> bool:
     if pd.isna(value):
         return True
@@ -188,7 +312,10 @@ def is_blank(value: object) -> bool:
 
 
 def merge_stock_rows(
-    existing: pd.DataFrame, new_rows: pd.DataFrame
+    existing: pd.DataFrame,
+    new_rows: pd.DataFrame,
+    *,
+    overwrite_columns: set[str] | None = None,
 ) -> tuple[pd.DataFrame, int, int]:
     existing_dates = set(existing["Date"].astype(str))
     append_rows = new_rows[~new_rows["Date"].astype(str).isin(existing_dates)]
@@ -210,7 +337,13 @@ def merge_stock_rows(
                     continue
 
                 value = row[column]
-                if is_blank(updated.at[row_index, column]) and not is_blank(value):
+                should_overwrite = (
+                    overwrite_columns is not None and column in overwrite_columns
+                )
+                if (
+                    (is_blank(updated.at[row_index, column]) or should_overwrite)
+                    and not is_blank(value)
+                ):
                     updated.at[row_index, column] = value
                     filled += 1
 
@@ -226,31 +359,41 @@ def append_new_rows(existing: pd.DataFrame, new_rows: pd.DataFrame) -> pd.DataFr
     return updated
 
 
-def refresh_stock_file(path: Path) -> None:
+def refresh_stock_file(path: Path, *, full_overwrite: bool = False) -> None:
     ticker = stock_ticker(path)
     if ticker is None:
         return
 
     original = clean_dates(pd.read_csv(path))
+    needs_history_backfill = needs_stock_history_backfill(original)
     today = date.today()
-    existing = drop_unclosed_rows(original, today)
-    start = stock_download_start(existing, today - timedelta(days=365 * 5), today)
+    existing = ensure_stock_schema(drop_unclosed_rows(original, today), ticker)
+    schema_changed = list(existing.columns) != list(original.columns)
+    start = stock_download_start(
+        existing,
+        today - timedelta(days=365 * 5),
+        today,
+        full_history=full_overwrite or needs_history_backfill,
+    )
     end = today
 
     if start >= end:
         existing, beta_filled = add_historical_beta(existing, ticker)
-        if len(existing) != len(original):
+        if len(existing) != len(original) or schema_changed:
             atomic_write_csv(existing, path)
             logging.info(
-                "%s: removed %s unclosed row(s)", ticker, len(original) - len(existing)
+                "%s: normalized schema and removed %s unclosed row(s)",
+                ticker,
+                len(original) - len(existing),
             )
         elif beta_filled:
             atomic_write_csv(existing, path)
         logging.info("%s: already current", ticker)
         return
 
+    yf_ticker = yfinance_ticker(ticker)
     downloaded = yf.download(
-        ticker,
+        yf_ticker,
         start=start.isoformat(),
         end=end.isoformat(),
         actions=True,
@@ -258,13 +401,15 @@ def refresh_stock_file(path: Path) -> None:
         progress=False,
         threads=False,
     )
-    downloaded = flatten_yfinance(downloaded, ticker)
+    downloaded = flatten_yfinance(downloaded, yf_ticker)
     if downloaded.empty:
         existing, beta_filled = add_historical_beta(existing, ticker)
-        if len(existing) != len(original):
+        if len(existing) != len(original) or schema_changed:
             atomic_write_csv(existing, path)
             logging.info(
-                "%s: removed %s unclosed row(s)", ticker, len(original) - len(existing)
+                "%s: normalized schema and removed %s unclosed row(s)",
+                ticker,
+                len(original) - len(existing),
             )
         elif beta_filled:
             atomic_write_csv(existing, path)
@@ -274,15 +419,20 @@ def refresh_stock_file(path: Path) -> None:
         return
 
     new_rows = format_stock_rows(downloaded, existing, ticker)
-    updated, added, filled = merge_stock_rows(existing, new_rows)
+    updated, added, filled = merge_stock_rows(
+        existing,
+        new_rows,
+        overwrite_columns=REFRESHABLE_STOCK_COLUMNS,
+    )
+    updated = add_dividend_yield(updated)
     updated, beta_filled = add_historical_beta(updated, ticker)
 
     removed = len(original) - len(existing)
-    if added or filled or removed or beta_filled:
+    if added or filled or removed or beta_filled or schema_changed:
         atomic_write_csv(updated, path)
     logging.info(
         (
-            "%s: appended %s row(s), filled %s blank value(s), "
+            "%s: appended %s row(s), refreshed %s value(s), "
             "filled %s beta value(s), removed %s unclosed row(s)"
         ),
         ticker,
@@ -293,10 +443,10 @@ def refresh_stock_file(path: Path) -> None:
     )
 
 
-def refresh_stocks() -> None:
+def refresh_stocks(*, full_overwrite: bool = False) -> None:
     for path in sorted(STOCKS_DIR.glob("*_stock_data.csv")):
         try:
-            refresh_stock_file(path)
+            refresh_stock_file(path, full_overwrite=full_overwrite)
         except Exception:
             logging.exception("Failed to refresh %s", path)
 
@@ -373,13 +523,29 @@ def refresh_risk_free_rate() -> None:
     logging.info("%s: appended %s risk-free-rate row(s)", FRED_SERIES_ID, added)
 
 
-def main() -> int:
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Refresh stock histories from yfinance and risk-free rates from FRED."
+    )
+    parser.add_argument(
+        "--full-overwrite",
+        action="store_true",
+        help=(
+            "Re-download every stock file from its earliest retained date and "
+            "replace yfinance price/action fields while preserving beta and metadata."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    args = parse_args(sys.argv[1:] if argv is None else argv)
 
-    refresh_stocks()
+    refresh_stocks(full_overwrite=args.full_overwrite)
     refresh_risk_free_rate()
     return 0
 

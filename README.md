@@ -25,10 +25,23 @@ From the project directory, run:
 .venv/bin/python scripts/refresh_stock_data.py
 ```
 
+To re-download the complete retained history for every stock CSV and overwrite
+the yfinance price, volume, dividend, and split fields while retaining beta and
+metadata columns:
+
+```bash
+.venv/bin/python scripts/refresh_stock_data.py --full-overwrite
+```
+
 The script reads and writes data under `/srv/data`:
 
 - `/srv/data/stocks/*_stock_data.csv`
 - `/srv/data/risk_free_rate/DGS3MO_risk_free_rate.csv`
+
+Stock refreshes retain existing metadata and beta columns while standardizing the
+yfinance fields to `Date`, `Open`, `High`, `Low`, `Close`, `Adj Close`, `Volume`,
+`Dividends`, and `Stock Splits`. Dividend yield, beta and all additional ticker
+files are preserved.
 
 ## Cron
 
